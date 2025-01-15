@@ -1,0 +1,433 @@
+Loading of raw data 
+```{r}
+setwd("C:/Users/viggo/Birc/PIB_rats")
+library(tidyverse)
+library(readxl)
+Rats <-read_excel("PMI_rat_blood_stable_features_normalized_batchnorm_pos.xlsx") 
+peak <- read.csv("peaklist.csv")
+feature <- read.csv("feature_table.csv")
+```
+
+Data QC Filtering
+```{r}
+# RUN LOADING OF RAW DATA BEFOREHAND
+
+
+#Filter to only being blood samples and sets all na values to 0
+feature_blood <- feature %>% filter(grepl("blood",name,ignore.case=T)) %>% mutate(across(everything(), ~ifelse(is.na(.), 0, .)))
+
+#Filter to only being blood samples and sets all na values to 0
+peak_blood <- peak %>% select(matches("mz|rt|blood"),npeaks) %>% mutate(across(everything(), ~ifelse(is.na(.),0, .)))
+
+#Make a dataset with only the blanks
+peak_blood_blank <- peak_blood %>% select(mz,rt,contains("blank"))
+
+# Make a collum for average blank response and a collum with the number of blanks for each Metabolite
+peak_blood_blank <- peak_blood_blank %>% rowwise() %>% mutate(average_blank=mean(c_across(3:ncol(peak_blood_blank))),blank_N=sum(c_across(2:ncol(peak_blood_blank))>0))
+
+# Make a dataset with only QC samples
+peak_blood_QC <- peak_blood %>% select(mz,rt,contains("QC"))
+QC_samples <- ncol(peak_blood_QC)-2
+
+# make the collums average QC rseponse, RSD(Relative Standard Deviation), the number QC samples for each predictor and the percentage of QC samples for each predictor
+peak_blood_QC <- peak_blood_QC %>% rowwise() %>% mutate(average_qc=mean(c_across(3:ncol(peak_blood_QC))),SD_qc=sd(c_across(3:ncol(peak_blood_QC))),RSD=(SD_qc/average_qc)*100,QC_count=sum(c_across((3:ncol(peak_blood_QC)))>0),percent_qc_count=(QC_count/QC_samples)*100)
+
+#Merge QC and Blank datasets and find the blank contribution for each predictor
+peak_blood_QC_blank <- merge(peak_blood_QC,peak_blood_blank,by="mz")  %>% mutate(blank_contribution=(average_blank/average_qc)*100)
+
+
+# Filter Away all features that has been detected in more than 2 blanks and where their contribution is greater than 5%. Also filtering away features with an QC RSD greater than 30% and QC Count less than 70 %
+peak_blood_filtered <- peak_blood_QC_blank %>% filter(!(blank_contribution>5 & blank_N>2),RSD<30,percent_qc_count>70)
+
+#Round the MZ and rt, and arrange the rows according to those values.
+peak_blood_filtered <- peak_blood_filtered %>% mutate(mz=round(mz),rt.x=round(rt.x)) %>% arrange(mz,rt.x)
+
+#peak_blood_QC_blank <- peak_blood_QC_blank %>% arrange(blank_contribution,blank_N)
+
+# Makes a list with all the feature being used
+feature_to_use <-paste0("M",round(peak_blood_filtered$mz),"T",round(peak_blood_filtered$rt.x)) 
+
+# A fucntion for handling duplicates by adding a suffix to the end of the feature 
+handle_duplicates <- function(vec) {
+  table <- table(vec)
+  counts <- integer(length(vec))
+  for (i in seq_along(vec)) {
+    counts[i] <- table[vec[i]]
+    table[vec[i]] <- table[vec[i]] - 1
+  }
+  suffix <- ifelse(counts > 1, paste0(".", counts - 1), "")
+  return(paste0(vec, suffix))
+}
+
+#Applying the hanle duplicates to the feature to use
+feature_to_use <- handle_duplicates(feature_to_use)
+
+
+# Filtering feature blood to only containg the feature found with QC and keeping only the PMI individuals
+feature_blood_QC <- feature_blood %>%  select(name,all_of(feature_to_use)) %>% filter(grepl("PMI",name,ignore.case=T))
+
+# Removes .mzML from the names of samples
+feature_blood_QC$name <- gsub("\\.mzML$", "", feature_blood_QC$name)
+```
+
+Early PCA
+```{r}
+library(factoextra)
+
+
+# Filtering Rats to only contain indviduals that has an PMI
+Rats_pure <- Rats %>% filter(!is.na(as.numeric(as.character(Time_since_death_h))))
+
+# Makes a dataset with only the rat id and the PMI group
+Rats_PMI <- Rats_pure[,c("Info","PMI_group")] %>% rename(name="Info")
+
+# Merge PMI into the feature table
+feature_blood_QC_group <- merge(feature_blood_QC, Rats_PMI, by="name")
+
+# Perform PCA
+PCA_blood_pre <- feature_blood_QC_group %>% select(-c("name","PMI_group"))
+
+PCA_blood <- prcomp(PCA_blood_pre)
+
+
+
+p <- fviz_pca_ind(PCA_blood,
+             geom.ind = "point",  
+             title = "PCA of My Data with Groups",
+             repel = TRUE
+)
+
+p + geom_point(aes(color=feature_blood_QC_group$PMI_group),shape = 19, size = 2)+labs(color="Days after death")
+
+
+
+
+```
+
+Correlation feature selection
+```{r}
+# RUN DATA QC FILTERING BEFOREHAND
+
+#Filters out to only contain replicants
+replication_group <- feature_blood_QC %>% filter(grepl("_rep",name,ignore.case=T)) %>% arrange(name)
+
+# Creates a "Midway filter" that creates a new collumn that that contains the rep ID, but with rep removed
+midway_filter <- replication_group %>%  mutate(name = gsub("_rep", "", name))
+
+# Creates a dataset with the samples corresponding to the replication ID's
+sample_group <- feature_blood_QC %>% filter(name%in%midway_filter$name) %>% arrange(name)
+
+# calculates the correlation for each feature  
+r2 <- rep(NA,ncol(sample_group)-1)
+for (i in 1:length(r2)) {
+  r2[i] <- cor(replication_group[,i+1],sample_group[,i+1])
+}
+# inserts the features and their corresponding correlation into a tibbel
+r2_validation <- tibble(name=names(sample_group[,2:length(sample_group)]),r2=r2)
+
+# Creates a vector with all the predictors with an r2 less than 0.95.
+predictors_keep <- r2_validation %>% filter(0.9<r2)
+predictors_keep_list <- predictors_keep$name
+
+# Creates a dataset that contains the features that has to be kept
+feature_blood_correlation <- feature_blood_QC %>% select(all_of(c("name", predictors_keep_list)))
+
+dim(feature_blood_correlation)
+
+```
+
+Correlation Graph
+```{r}
+# RUN CORRELATION FEATURE SELECTION BEFOREH
+
+ggplot(r2_validation,aes(x=r2))+
+  geom_histogram(bins = 30)
+```
+
+
+Removal of replication
+```{r}
+# RUN CORRELATION FEATURE SELCTION BEFOREHAND
+
+reps_bind <- rbind(midway_filter,sample_group) %>% group_by(name) %>%  summarize(across(where(is.numeric), mean, na.rm = TRUE)) %>% select(all_of(c("name", predictors_keep_list)))
+
+brep_group <- feature_blood_correlation %>% filter(grepl("_brep",name,ignore.case=T)) %>% arrange(name)
+
+result_df <- data.frame()
+brep_group$sample <- sub("_brep[12]_B[12]$","",brep_group$name)
+
+  # Loop through each unique sample
+for (Sample in unique(brep_group$sample)) {
+    # Subset the data frame for the current sample
+  sample_df <- brep_group[brep_group$sample == Sample, ]
+    
+    # Randomly select one row (either brep1 or brep2)
+  selected_batch <- sample(sample_df$name, 1)
+    
+    # Add the selected row to the result data frame
+  result_df <- rbind(result_df, sample_df[sample_df$name == selected_batch, ])
+  }
+
+#Remove replicates and batch replicates from batch 1
+feature_blood_clean <- feature_blood_correlation %>% filter(!(grepl("_rep_|_brep",name,ignore.case=T))) %>% rows_update(reps_bind, by="name") %>% bind_rows(result_df) %>% select(-sample)
+
+
+
+dim(feature_blood_clean)
+```
+
+Heatmap
+```{r}
+# RUN CORRELATION FEATURE SELECTION BEFORHAND
+library(pheatmap)
+
+feature_correlation <- cor(feature_blood_clean[,-1])
+
+pheatmap(feature_correlation,show_rownames = F,show_colnames = F)
+
+
+
+```
+
+Addition of PMI group into the dataframe
+```{r}
+# Merge PMI into the feature table
+feature_blood_PMI_group <- merge(feature_blood_clean, Rats_PMI, by="name")
+
+```
+
+PCA 
+```{r}
+PCA_clean_blood_pre <- feature_blood_PMI_group %>% select(-c("name","PMI_group"))
+
+PCA_clean_blood <- prcomp(PCA_clean_blood_pre)
+
+
+p <- fviz_pca_ind(PCA_clean_blood,
+             geom.ind = "point",  
+             title = "PCA of My Data with Groups",
+             repel = TRUE
+)
+
+p + geom_point(aes(color=feature_blood_PMI_group$PMI_group),shape = 19, size = 2)+labs(color="Days after death")
+```
+
+Normalization 
+```{r}
+
+batch_data <- feature_blood_PMI_group %>% mutate(batch=case_when(str_detect(name,"B1$")~"B1",str_detect(name,"B2$")~"B2")) 
+
+batch_normalized <- batch_data %>% group_by(batch) %>% mutate(across(where(is.numeric),~(. - min(.)) / (max(.) - min(.)))) %>% ungroup()
+
+feature_blood_normalized <- batch_normalized %>% select(-c(name,batch))
+```
+
+
+Test bedst
+```{r}
+# Initialize variables
+pval <- rep(NA, ncol(feature_blood_normalized) - 1)
+mean_diff <- pval
+wilcox_pval <- pval
+perm_diffs <- numeric(10000)
+perm_pval <- pval
+obs_diff <- pval
+
+unique_predictors_list <- list()
+significant_count_list <- list()  
+groups <- length(unique(feature_blood_normalized$PMI_group)) - 1
+
+
+for (group in 1:groups) {
+  First_group <- feature_blood_normalized %>% 
+    filter(PMI_group == paste0("Day ", group - 1)) %>% 
+    select(-PMI_group)
+  
+  Second_group <- feature_blood_normalized %>% 
+    filter(PMI_group == paste0("Day ", group)) %>% 
+    select(-PMI_group)
+  
+  for (features in seq_along(pval)) {
+    set.seed(1)
+    First_data <- First_group[, features, drop = TRUE]
+    Second_data <- Second_group[, features, drop = TRUE]
+    
+    # t-test and Wilcoxon test
+    pval[features] <- t.test(First_data, Second_data)$p.value
+    wilcox_pval[features] <- suppressWarnings(wilcox.test(First_data, Second_data)$p.value)
+    
+    # Permutation testing
+    obs_diff[features] <- mean(First_data) - mean(Second_data)
+    combined_data <- c(First_data, Second_data)
+    for (perm in seq_along(perm_diffs)) {
+      indices <- sample(seq_along(combined_data), length(First_data))
+      perm_diffs[perm] <- mean(combined_data[indices]) - mean(combined_data[-indices])
+    }
+    perm_pval[features] <- (sum(abs(perm_diffs) >= abs(obs_diff[features])) + 1) / (length(perm_diffs) + 1)
+  }
+  
+  # Adjust p-values
+  pval <- p.adjust(pval, method = "BH")
+  wilcox_pval <- p.adjust(wilcox_pval, method = "BH")
+  perm_pval <- p.adjust(perm_pval, method = "BH")
+  
+  # Significant predictors
+  full_pval <- tibble(Predictors = colnames(First_group), 
+                      t_test_p = pval, 
+                      wilcox_p = wilcox_pval, 
+                      perm_p = perm_pval)
+  
+  t_test_sig <- full_pval %>% filter(t_test_p < 0.05) %>% pull(Predictors)
+  wilcox_sig <- full_pval %>% filter(wilcox_p < 0.05) %>% pull(Predictors)
+  perm_sig <- full_pval %>% filter(perm_p < 0.05) %>% pull(Predictors)
+  
+  common_predictors <- Reduce(intersect, list(t_test_sig, wilcox_sig, perm_sig))
+  unique_predictors <- setdiff(union(union(t_test_sig, wilcox_sig), perm_sig), common_predictors)
+  
+  # Identify origin of unique predictors
+  unique_predictors_df <- tibble(
+    Predictor = unique_predictors,
+    In_t_test = unique_predictors %in% t_test_sig,
+    In_wilcox = unique_predictors %in% wilcox_sig,
+    In_perm = unique_predictors %in% perm_sig
+  ) %>%
+    mutate(across(-Predictor, ~ ifelse(.x, "Is significant", "Is not significant")))
+  
+  # Save unique predictors to the list
+  unique_predictors_list[[paste0("Group_", group)]] <- unique_predictors_df
+  
+  # Count significant features and save to the list
+  significant_count_list[[paste0("Group_", group)]] <- list(
+    t_test_count = length(t_test_sig),
+    wilcox_count = length(wilcox_sig),
+    perm_count = length(perm_sig)
+  )
+}
+
+
+```
+
+
+Perm Bedst
+```{r}
+pval <- rep(NA,ncol(feature_blood_normalized)-1)
+mean_dif <- pval
+obs_diff <- pval
+perm_diffs <- numeric(100000)  
+all_tibbles <- list()
+change <- pval
+change_tibbles <- list()
+
+
+groups <- length(unique(feature_blood_normalized$PMI_group))-1
+
+summary_0_05 <- tibble(
+  group_comparison = character(),
+  total_significant = numeric(),
+  significant_increase = numeric(),
+  significant_decrease = numeric()
+)
+
+
+for (i in 1:groups) {
+ 
+  First_group <- feature_blood_normalized %>% 
+    filter(PMI_group == paste0("Day ", i - 1)) %>% 
+    select(-PMI_group)
+  
+  Second_group <- feature_blood_normalized %>% 
+    filter(PMI_group == paste0("Day ", i)) %>% 
+    select(-PMI_group)
+  
+  for (pred in 1:length(pval)) {
+    set.seed(1)
+    First_pred <- First_group[, pred, drop = TRUE]
+    Second_pred <- Second_group[, pred, drop = TRUE]
+    obs_diff[pred] <- mean(First_pred) - mean(Second_pred)
+    all_data <- c(First_pred, Second_pred)
+    n <- length(First_pred)  
+    
+    
+    for (perm in seq_along(perm_diffs)) {
+      perm_indices <- sample(length(all_data), n) 
+      perm_group1 <- all_data[perm_indices]
+      perm_group2 <- all_data[-perm_indices]
+      perm_diffs[perm] <- mean(perm_group1) - mean(perm_group2)
+    }
+    
+   
+    pval[pred] <- (sum(abs(perm_diffs) >= abs(obs_diff[pred])) + 1) / (length(perm_diffs) + 1)
+  }
+  
+
+  tibble_data <- tibble(
+    features = colnames(First_group),
+    p_val = p.adjust(pval, method = "BH"),
+    mean_dif = obs_diff
+  )
+  pval <- tibble_data$p_val
+  
+  
+  change <- ifelse(pval >= 0.05, 
+                   "Non-significant", 
+                   ifelse(obs_diff < 0, "Significant increase", "Significant reduction"))
+  
+  
+  
+  change_data <- tibble(
+    features = colnames(First_group),
+    changes = change
+  )
+  
+  
+  
+  
+  all_tibbles[[paste0("changes_from_day_", i - 1, "_to_", i)]] <- tibble_data
+  change_tibbles[[paste0("changes_from_day_", i - 1, "_to_", i)]] <- change_data
+  
+  
+
+  total_significant_0_05 <- sum(change_data$changes != "Non-significant")
+  significant_increase_0_05 <- sum(change_data$changes == "Significant increase")
+  significant_decrease_0_05 <- sum(change_data$changes == "Significant reduction")
+  
+  summary_0_05 <- summary_0_05 %>%
+    add_row(
+      group_comparison = paste0("Day ", i - 1, " to Day ", i),
+      total_significant = total_significant_0_05,
+      significant_increase = significant_increase_0_05,
+      significant_decrease = significant_decrease_0_05
+    )
+}
+
+
+combined_dataframe <- do.call(cbind, lapply(all_tibbles, function(x) x %>% select(-features)))
+
+combined_changes <- do.call(cbind, lapply(seq_along(change_tibbles), function(i) {
+  x <- change_tibbles[[i]] %>% select(-features)
+  colnames(x) <- paste0("changes_from_day_", i - 1, "_to_", i)
+  x
+}))
+
+
+
+combined_dataframe <- tibble(
+  features = all_tibbles[[1]]$features,
+  combined_dataframe
+)
+
+combined_changes <- tibble(
+  features = change_tibbles[[1]]$features,
+  combined_changes
+)
+
+
+
+pval_columns <- grep("p_val", colnames(combined_dataframe), value = TRUE)
+
+combined_dataframe <- combined_dataframe %>%
+  filter(!apply(select(., all_of(pval_columns)), 1, function(row) all(row > 0.001)))
+
+combined_changes <- combined_changes %>%
+  filter(!apply(across(-features), 1, function(row) all(row == "Non-significant")))
+```
